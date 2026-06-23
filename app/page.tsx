@@ -2,6 +2,7 @@
 
 import dynamic from "next/dynamic";
 import { useEffect, useState } from "react";
+import type { Session } from "@supabase/supabase-js";
 import {
   Activity,
   Archive,
@@ -25,6 +26,7 @@ import {
 } from "@/domain/provider-settings";
 import { readApiError } from "@/lib/api-error";
 import { samplePlan, samplePrompt, sampleReport } from "@/lib/sample-data";
+import { createBrowserSupabaseClient } from "@/lib/supabase-browser";
 
 const TrendChart = dynamic(
   () => import("@/components/trend-chart").then((mod) => mod.TrendChart),
@@ -75,6 +77,11 @@ const providerStatusClass: Record<StatusKind, string> = {
 
 export default function Home() {
   const [activeView, setActiveView] = useState<View>("Dashboard");
+  const [supabase] = useState(() => createBrowserSupabaseClient());
+  const [session, setSession] = useState<Session | null>(null);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authStatus, setAuthStatus] = useState<ProviderStatus | null>(null);
   const [providerSettings, setProviderSettings] = useState<ProviderSettings>({
     ...DEFAULT_THIRD_PARTY_PROVIDER
   });
@@ -86,6 +93,29 @@ export default function Home() {
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
   const providerDefaults = getProviderDisplayDefaults();
 
+  const authHeaders = (): Record<string, string> =>
+    session?.access_token
+      ? {
+          Authorization: `Bearer ${session.access_token}`
+        }
+      : {};
+
+  useEffect(() => {
+    void supabase.auth.getSession().then(({ data, error }) => {
+      if (!error) {
+        setSession(data.session);
+      }
+    });
+
+    const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+    });
+
+    return () => {
+      data.subscription.unsubscribe();
+    };
+  }, [supabase]);
+
   useEffect(() => {
     if (activeView !== "Settings") {
       return;
@@ -93,7 +123,9 @@ export default function Home() {
 
     async function loadProviderSettings() {
       try {
-        const response = await fetch("http://127.0.0.1:4000/api/providers/settings");
+        const response = await fetch("http://127.0.0.1:4000/api/providers/settings", {
+          headers: authHeaders()
+        });
 
         if (!response.ok) {
           setProviderStatus({
@@ -116,7 +148,47 @@ export default function Home() {
     }
 
     void loadProviderSettings();
-  }, [activeView]);
+  }, [activeView, session?.access_token]);
+
+  async function signIn() {
+    setAuthStatus({ kind: "info", text: "Signing in..." });
+
+    const { error } = await supabase.auth.signInWithPassword({
+      email: authEmail,
+      password: authPassword
+    });
+
+    setAuthStatus(
+      error
+        ? { kind: "error", text: error.message }
+        : { kind: "success", text: "Signed in." }
+    );
+  }
+
+  async function signUp() {
+    setAuthStatus({ kind: "info", text: "Creating account..." });
+
+    const { error } = await supabase.auth.signUp({
+      email: authEmail,
+      password: authPassword
+    });
+
+    setAuthStatus(
+      error
+        ? { kind: "error", text: error.message }
+        : { kind: "success", text: "Account created. Check email if confirmation is enabled." }
+    );
+  }
+
+  async function signOut() {
+    const { error } = await supabase.auth.signOut();
+
+    setAuthStatus(
+      error
+        ? { kind: "error", text: error.message }
+        : { kind: "success", text: "Signed out." }
+    );
+  }
 
   async function saveProviderSettings() {
     setProviderStatus({
@@ -128,7 +200,8 @@ export default function Home() {
       const response = await fetch("http://127.0.0.1:4000/api/providers/settings", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
+          ...authHeaders()
         },
         body: JSON.stringify(providerSettings)
       });
@@ -167,7 +240,8 @@ export default function Home() {
       const response = await fetch("http://127.0.0.1:4000/api/providers/test", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
+          ...authHeaders()
         },
         body: JSON.stringify({
           message: testMessage,
@@ -274,6 +348,71 @@ export default function Home() {
                   </div>
 
                   <div className="mt-5 grid gap-4">
+                    <section className="rounded-md border border-aether-border bg-aether-bg/50 p-4">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+                        <div className="grid flex-1 gap-2 text-sm font-semibold text-aether-text">
+                          Account email
+                          <input
+                            className="h-10 rounded-md border border-aether-border bg-white px-3 text-sm font-medium outline-none focus:border-aether-secondary"
+                            onChange={(event) => setAuthEmail(event.target.value)}
+                            placeholder="you@example.com"
+                            type="email"
+                            value={authEmail}
+                          />
+                        </div>
+                        <div className="grid flex-1 gap-2 text-sm font-semibold text-aether-text">
+                          Password
+                          <input
+                            className="h-10 rounded-md border border-aether-border bg-white px-3 text-sm font-medium outline-none focus:border-aether-secondary"
+                            onChange={(event) => setAuthPassword(event.target.value)}
+                            placeholder="Password"
+                            type="password"
+                            value={authPassword}
+                          />
+                        </div>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {session ? (
+                          <button
+                            className="inline-flex h-9 items-center justify-center rounded-md border border-aether-border bg-white px-3 text-sm font-semibold text-aether-text"
+                            onClick={signOut}
+                            type="button"
+                          >
+                            Sign out
+                          </button>
+                        ) : (
+                          <>
+                            <button
+                              className="inline-flex h-9 items-center justify-center rounded-md bg-aether-primary px-3 text-sm font-semibold text-white"
+                              onClick={signIn}
+                              type="button"
+                            >
+                              Sign in
+                            </button>
+                            <button
+                              className="inline-flex h-9 items-center justify-center rounded-md border border-aether-border bg-white px-3 text-sm font-semibold text-aether-text"
+                              onClick={signUp}
+                              type="button"
+                            >
+                              Sign up
+                            </button>
+                          </>
+                        )}
+                        <span className="inline-flex h-9 items-center rounded-md px-2 text-xs font-semibold text-slate-600">
+                          {session ? `Signed in as ${session.user.email}` : "Using local-dev fallback"}
+                        </span>
+                      </div>
+                      {authStatus ? (
+                        <p
+                          className={`mt-3 rounded-md border p-3 text-sm font-semibold ${
+                            providerStatusClass[authStatus.kind]
+                          }`}
+                        >
+                          {authStatus.text}
+                        </p>
+                      ) : null}
+                    </section>
+
                     <label className="grid gap-2 text-sm font-semibold text-aether-text">
                       Provider name
                       <input

@@ -1,18 +1,16 @@
 import { cors } from "@elysiajs/cors";
 import { Elysia, t } from "elysia";
-import { readFile, writeFile } from "node:fs/promises";
 
 import { buildAllowedOrigins } from "../src/api/cors";
 import {
-  applyProviderSettingsToProcessEnv,
   buildProviderSettingsFromEnv,
-  mergeProviderWithExistingKeys,
-  updateEnvTextWithProviderSettings
+  mergeProviderWithExistingKeys
 } from "../src/domain/provider-config-store";
 import { planAutomation } from "../src/domain/planner";
-import { normalizeProviderSettings } from "../src/domain/provider-settings";
+import { normalizeProviderSettings, type ProviderSettings } from "../src/domain/provider-settings";
 import { generateReportPreview } from "../src/domain/report";
 import { createChatCompletion, createEmbedding } from "../src/integrations/openai-compatible";
+import { getEncryptionKey } from "../src/integrations/provider-encryption";
 import {
   buildPineconeRecord,
   describePineconeIndex,
@@ -20,10 +18,16 @@ import {
   upsertPineconeRecords,
   type PineconeSourceType
 } from "../src/integrations/pinecone";
+import { getSupabaseServiceClient } from "../src/integrations/supabase";
+import {
+  getProviderSettingsWithSecrets,
+  loadProviderSettings,
+  saveProviderSettings
+} from "../src/integrations/supabase-provider-settings";
 
 const port = Number(process.env.API_PORT ?? 4000);
 const allowedOrigins = buildAllowedOrigins(process.env);
-const envFileUrl = new URL("../.env", import.meta.url);
+const fallbackProviderSettingsUserId = process.env.PROVIDER_SETTINGS_USER_ID ?? "local-dev";
 
 const providerSettingsBody = t.Object({
   name: t.String({ minLength: 1 }),
@@ -44,12 +48,66 @@ const providerSettingsBody = t.Object({
   timeoutMs: t.Number({ minimum: 1 })
 });
 
-const readEnvFile = async () => {
-  try {
-    return await readFile(envFileUrl, "utf8");
-  } catch {
-    return "";
+const fallbackProviderSnapshot = () => buildProviderSettingsFromEnv(process.env);
+
+const isMissingProviderSettingsTableError = (error: unknown) =>
+  error instanceof Error && /provider_settings|schema cache|does not exist/i.test(error.message);
+
+const getProviderSettingsUserId = async (request: Request) => {
+  const authorization = request.headers.get("authorization") ?? "";
+  const token = authorization.replace(/^Bearer\s+/i, "").trim();
+
+  if (!token || token === authorization) {
+    return fallbackProviderSettingsUserId;
   }
+
+  const { data, error } = await getSupabaseServiceClient().auth.getUser(token);
+
+  if (error || !data.user?.id) {
+    throw new Error("Unauthorized");
+  }
+
+  return data.user.id;
+};
+
+const loadSavedProviderSettings = async (userId: string) => {
+  try {
+    return await loadProviderSettings(
+      getSupabaseServiceClient(),
+      userId,
+      getEncryptionKey()
+    );
+  } catch (error) {
+    if (isMissingProviderSettingsTableError(error)) {
+      return null;
+    }
+
+    throw error;
+  }
+};
+
+const getProviderSettingsForRequest = async (settings: ProviderSettings, userId: string) => {
+  try {
+    const savedProvider = await getProviderSettingsWithSecrets(
+      getSupabaseServiceClient(),
+      userId,
+      getEncryptionKey()
+    );
+
+    if (savedProvider) {
+      return normalizeProviderSettings({
+        ...settings,
+        apiKey: settings.apiKey.trim() || savedProvider.apiKey,
+        cohereApiKey: settings.cohereApiKey.trim() || savedProvider.cohereApiKey
+      });
+    }
+  } catch (error) {
+    if (!isMissingProviderSettingsTableError(error)) {
+      throw error;
+    }
+  }
+
+  return mergeProviderWithExistingKeys(settings, process.env);
 };
 
 const app = new Elysia()
@@ -64,11 +122,25 @@ const app = new Elysia()
     ok: true,
     service: "aetherflow-api"
   }))
-  .get("/api/providers/settings", () => buildProviderSettingsFromEnv(process.env))
+  .get("/api/providers/settings", async ({ request, set }) => {
+    try {
+      const userId = await getProviderSettingsUserId(request);
+      const savedProvider = await loadSavedProviderSettings(userId);
+
+      return savedProvider ?? fallbackProviderSnapshot();
+    } catch (error) {
+      set.status = error instanceof Error && error.message === "Unauthorized" ? 401 : 503;
+
+      return {
+        error: error instanceof Error ? error.message : "Unable to load provider settings"
+      };
+    }
+  })
   .post(
     "/api/providers/settings",
-    async ({ body, set }) => {
+    async ({ body, request, set }) => {
       try {
+        const userId = await getProviderSettingsUserId(request);
         const provider = normalizeProviderSettings({
           name: body.name,
           baseUrl: body.baseUrl,
@@ -80,19 +152,27 @@ const app = new Elysia()
           cohereInputType: body.cohereInputType ?? "search_query",
           timeoutMs: body.timeoutMs
         });
-        const envText = await readEnvFile();
-        const updatedEnvText = updateEnvTextWithProviderSettings(envText, provider);
-        const mergedProvider = mergeProviderWithExistingKeys(provider, process.env);
 
-        await writeFile(envFileUrl, updatedEnvText, "utf8");
-        applyProviderSettingsToProcessEnv(mergedProvider);
-
-        return buildProviderSettingsFromEnv(process.env);
+        return await saveProviderSettings(
+          getSupabaseServiceClient(),
+          userId,
+          provider,
+          getEncryptionKey()
+        );
       } catch (error) {
-        set.status = 503;
+        set.status =
+          error instanceof Error && error.message === "Unauthorized"
+            ? 401
+            : isMissingProviderSettingsTableError(error)
+              ? 424
+              : 503;
 
         return {
-          error: error instanceof Error ? error.message : "Unable to save provider settings"
+          error: isMissingProviderSettingsTableError(error)
+            ? "Supabase table public.provider_settings is missing. Run docs/supabase-provider-settings.sql in the Supabase SQL editor."
+            : error instanceof Error
+              ? error.message
+              : "Unable to save provider settings"
         };
       }
     },
@@ -196,9 +276,10 @@ const app = new Elysia()
   )
   .post(
     "/api/providers/test",
-    async ({ body, set }) => {
+    async ({ body, request, set }) => {
       try {
-        const provider = mergeProviderWithExistingKeys({
+        const userId = await getProviderSettingsUserId(request);
+        const provider = await getProviderSettingsForRequest({
           name: body.provider.name,
           baseUrl: body.provider.baseUrl,
           apiKey: body.provider.apiKey,
@@ -208,7 +289,7 @@ const app = new Elysia()
           cohereEmbeddingModel: body.provider.cohereEmbeddingModel ?? "embed-v4.0",
           cohereInputType: body.provider.cohereInputType ?? "search_query",
           timeoutMs: body.provider.timeoutMs
-        }, process.env);
+        }, userId);
 
         if (!provider.apiKey) {
           set.status = 422;
@@ -245,7 +326,7 @@ const app = new Elysia()
           }
         );
       } catch (error) {
-        set.status = 503;
+        set.status = error instanceof Error && error.message === "Unauthorized" ? 401 : 503;
 
         return {
           content: "",
